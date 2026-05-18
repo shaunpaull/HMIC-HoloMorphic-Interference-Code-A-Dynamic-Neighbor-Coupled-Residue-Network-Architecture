@@ -1,0 +1,146 @@
+import hashlib
+import math
+import os
+import random
+from dataclasses import dataclass
+from functools import reduce
+from typing import List, Optional
+
+# Math primitives
+def egcd(a, b):
+    if a == 0: return b, 0, 1
+    g, x, y = egcd(b % a, a)
+    return g, y - (b // a) * x, x
+
+def modinv(a, m):
+    g, x, _ = egcd(a % m, m)
+    if g != 1: raise ValueError(f"No inverse {a} mod {m}")
+    return x % m
+
+def crt(residues, moduli):
+    M = reduce(lambda x, y: x * y, moduli, 1)
+    x = 0
+    for r, m in zip(residues, moduli):
+        Mi = M // m
+        yi = modinv(Mi % m, m)
+        x += r * Mi * yi
+    return x % M
+
+# Geometry
+BASE_PRIMES = [257, 263, 269, 271, 277, 281, 283, 293, 307, 311]
+
+def derive_geometry(seed, shard_idx):
+    h = hashlib.sha256(seed + shard_idx.to_bytes(2, 'big')).digest()
+    p = BASE_PRIMES[shard_idx % len(BASE_PRIMES)] + (h[0] % 32) + 1
+    if p % 2 == 0: p += 1
+    while True:
+        if all(p % x != 0 for x in range(3, int(math.sqrt(p))+1, 2)):
+            break
+        p += 2
+    b = 5 + (h[1] % 31)
+    while math.gcd(b, p) != 1:
+        b += 1
+        if b >= p: b = 5
+    lam = int.from_bytes(h[2:5], 'big') % p
+    alpha = h[5] % 5
+    beta = h[6] % 5
+    return p, b, lam, alpha, beta
+
+@dataclass
+class HMICShard:
+    index: int
+    residues: List[int]
+    anchor_seed: bytes
+    data_hash: bytes
+    pad_len: int
+    mac: bytes
+
+class HMIC:
+    """HMIC: Dynamic Neighbor-Coupled Residue Network Code"""
+    def __init__(self, n=10, k=7, chunk_bytes=2):
+        self.n = n
+        self.k = k
+        self.chunk_bytes = chunk_bytes
+
+    def _mac(self, idx, residues, data_hash):
+        d = idx.to_bytes(2,'big') + b''.join(r.to_bytes(4,'big') for r in residues) + data_hash
+        return hashlib.sha256(b"HMIC-secret" + d).digest()[:12]
+
+    def encode(self, data: bytes):
+        data_hash = hashlib.sha256(data).digest()
+        pad_len = (self.chunk_bytes - len(data) % self.chunk_bytes) % self.chunk_bytes
+        padded = data + b'\x00' * pad_len
+        chunks = [int.from_bytes(padded[i:i+self.chunk_bytes], 'big') for i in range(0, len(padded), self.chunk_bytes)]
+
+        seeds = []
+        prev = b'\x00'*32
+        for j, C in enumerate(chunks):
+            s = hashlib.sha256(C.to_bytes(self.chunk_bytes,'big') + j.to_bytes(4,'big') + prev).digest()
+            seeds.append(s)
+            prev = s
+
+        shard_res = [[] for _ in range(self.n)]
+        for j, C in enumerate(chunks):
+            prev_C = chunks[j-1] if j > 0 else 0
+            next_C = chunks[j+1] if j < len(chunks)-1 else 0
+            for i in range(self.n):
+                p, b, lam, alpha, beta = derive_geometry(seeds[j], i)
+                I = (alpha * prev_C + beta * next_C) % p
+                r = (b * C + lam + I) % p
+                shard_res[i].append(r)
+
+        return [HMICShard(i, shard_res[i], seeds[0], data_hash, pad_len, self._mac(i, shard_res[i], data_hash)) for i in range(self.n)]
+
+    def decode(self, shards_in, max_iter=8):
+        valid = [s for s in shards_in if s is not None]
+        good = [s for s in valid if s.mac == self._mac(s.index, s.residues, s.data_hash)]
+        if len(good) < self.k:
+            raise ValueError("Not enough authentic shards")
+        selected = good[:self.k]
+        n_chunks = len(selected[0].residues)
+        anchor = selected[0].anchor_seed
+        pad_len = selected[0].pad_len
+
+        C_est = [0] * n_chunks
+        for _ in range(max_iter):
+            new_C = []
+            curr_seed = anchor
+            prev_C = 0
+            for j in range(n_chunks):
+                residues_l, moduli_l = [], []
+                next_est = C_est[j+1] if j+1 < n_chunks else 0
+                for s in selected:
+                    p, b, lam, alpha, beta = derive_geometry(curr_seed, s.index)
+                    I = (alpha * prev_C + beta * next_est) % p
+                    r = s.residues[j]
+                    val = (r - lam - I) % p
+                    c = (val * modinv(b, p)) % p
+                    residues_l.append(c)
+                    moduli_l.append(p)
+                C = crt(residues_l, moduli_l)
+                new_C.append(C)
+                curr_seed = hashlib.sha256(C.to_bytes(self.chunk_bytes,'big') + j.to_bytes(4,'big') + curr_seed).digest()
+                prev_C = C
+            C_est = new_C
+
+        raw = b''.join(c.to_bytes(self.chunk_bytes, 'big') for c in C_est)
+        data = raw[:-pad_len] if pad_len else raw
+        if hashlib.sha256(data).digest() != selected[0].data_hash:
+            raise ValueError("Hash mismatch")
+        return data
+
+# ====================== RUN ======================
+hmic = HMIC(n=10, k=7, chunk_bytes=2)
+test_data = b"HoloMorphic Test Data " * 30 + os.urandom(256)
+
+shards = hmic.encode(test_data)
+
+# Simulate erasures
+for i in random.sample(range(hmic.n), hmic.n - hmic.k):
+    shards[i] = None
+
+recovered = hmic.decode(shards)
+print("Exact recovery:", recovered == test_data)
+print("Lengths:", len(test_data), len(recovered))
+print("First 100 bytes match:", test_data[:100] == recovered[:100])
+
