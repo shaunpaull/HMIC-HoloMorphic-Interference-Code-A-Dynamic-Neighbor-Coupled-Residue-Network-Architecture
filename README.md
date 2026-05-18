@@ -376,7 +376,7 @@ HMIC should currently be viewed as:
 
 "An experimental content-conditioned residue coding architecture"
 
-rather than a replacement for production Reed–Solomon syst
+rather than a replacement for production Reed–Solomon system
 
 
 
